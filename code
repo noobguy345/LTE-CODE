@@ -1,0 +1,2153 @@
+#install/import
+!pip -q install astroquery astropy scipy pandas matplotlib
+
+import os
+import re
+import gzip
+import tarfile
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.constants import pi
+from astropy.io import fits
+
+warnings.filterwarnings("ignore")
+
+#paths
+BASE = "/content/drive/MyDrive/stellar"
+MARCS_DIR = os.path.join(BASE, "MARCS")
+
+os.makedirs(BASE, exist_ok=True)
+os.makedirs(MARCS_DIR, exist_ok=True)
+
+#constants
+H = 6.62607015e-27
+C = 2.99792458e10
+KB = 1.380649e-16
+ME = 9.1093837139e-28
+EE = 4.8032047126e-10
+MH = 1.6735575e-24
+
+EV_TO_ERG = 1.602176634e-12
+CMINV_TO_EV = 1.239841984e-4
+
+FE_H_SUN = 10**(7.50 - 12.0)
+X_H = 0.738
+MU = 1.24
+
+print("Solar Fe/H =", FE_H_SUN)
+
+#fgk sample
+stars = pd.DataFrame([
+    ["HIP104659", "F dwarf", 6040, 4.34, -0.97],
+    ["HIP79672", "G dwarf", 5824, 4.42, 0.03],
+    ["HIP101345", "G subgiant", 5514, 3.95, -0.037],
+    ["HIP95362", "G subgiant", 5268, 3.77, -0.11],
+    ["HIP37826", "K giant", 4810, 2.55, 0.02],
+    ["HIP104214", "K dwarf", 4398, 4.63, -0.13],
+], columns=["HIP", "Type", "Teff", "logg", "FeH"])
+
+display(stars)
+
+#nist data
+FE_I = os.path.join(BASE, "FeI_lines.tsv")
+FE_II = os.path.join(BASE, "FeII_lines.tsv")
+
+if not os.path.exists(FE_I):
+    raise FileNotFoundError(f"Missing {FE_I}")
+
+if not os.path.exists(FE_II):
+    raise FileNotFoundError(f"Missing {FE_II}")
+
+fe1 = pd.read_csv(FE_I, sep="\t")
+fe2 = pd.read_csv(FE_II, sep="\t")
+
+print("NIST Fe I rows:", len(fe1))
+print("NIST Fe II rows:", len(fe2))
+
+#clean atomic data
+def clean_nist(df):
+    out = df.copy()
+
+    required = [
+        "obs_wl_air(nm)",
+        "log_gf",
+        "Ei(cm-1)",
+        "g_i",
+        "Aki(s^-1)"
+    ]
+
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.dropna(
+        subset=["obs_wl_air(nm)", "log_gf", "Ei(cm-1)", "g_i"]
+    )
+
+    out = out[
+        (out["obs_wl_air(nm)"] >= 480.0) &
+        (out["obs_wl_air(nm)"] <= 680.0)
+    ]
+
+    good_acc = ["A", "B+", "B", "C+"]
+
+    if "Acc" in out.columns:
+        out = out[
+            out["Acc"].astype(str).str.strip().isin(good_acc)
+        ]
+
+    out = out[out["log_gf"] >= -3.0]
+
+    return out.reset_index(drop=True)
+
+
+fe1_clean = clean_nist(fe1)
+fe2_clean = clean_nist(fe2)
+
+print("Usable Fe I candidates:", len(fe1_clean))
+print("Usable Fe II candidates:", len(fe2_clean))
+
+#partition functions
+T_U = np.array([
+    4000, 4500, 5000, 5500, 6000,
+    6500, 7000, 7500, 8000, 8500,
+    9000, 9500, 10000
+], dtype=float)
+
+U_FEI = np.array([
+    24.5, 26.2, 28.0, 30.1, 31.8,
+    34.0, 37.0, 40.5, 44.0, 47.0,
+    50.4, 55.0, 59.7
+])
+
+U_FEII = np.array([
+    39.0, 41.3, 43.5, 45.8, 47.8,
+    50.0, 52.8, 55.2, 57.6, 59.5,
+    61.5, 64.0, 66.9
+])
+
+
+def U_FeI(T):
+    return np.interp(np.asarray(T), T_U, U_FEI)
+
+
+def U_FeII(T):
+    return np.interp(np.asarray(T), T_U, U_FEII)
+
+
+#marcs paths
+MARCS_MODEL_HD195564 = os.path.join(
+    MARCS_DIR,
+    "p5500_g+4.0_m0.0_t00_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod.gz"
+)
+
+if not os.path.exists(MARCS_MODEL_HD195564):
+    raise FileNotFoundError(
+        "HD195564 MARCS model not found:\n" + MARCS_MODEL_HD195564
+    )
+
+MARCS_TAR_CANDIDATES = [
+    os.path.join(MARCS_DIR, "marcs_st_mod.tar"),
+    os.path.join(BASE, "marcs_st_mod.tar"),
+    "/content/marcs_st_mod.tar"
+]
+
+MARCS_TAR = next(
+    (p for p in MARCS_TAR_CANDIDATES if os.path.exists(p)),
+    None
+)
+
+if MARCS_TAR:
+    print("MARCS archive:", MARCS_TAR)
+else:
+    print("MARCS archive not found; using extracted models.")
+
+#marcs filename parser
+def parse_marcs_filename(path_or_name):
+    name = os.path.basename(str(path_or_name))
+
+    match = re.search(
+        r"p(\d{4})_g([+-]\d+\.\d)_m([+-]?\d+\.\d)",
+        name
+    )
+
+    if match is None or "_st_" not in name:
+        return None
+
+    return {
+        "member": str(path_or_name),
+        "basename": name,
+        "Teff": float(match.group(1)),
+        "logg": float(match.group(2)),
+        "FeH": float(match.group(3))
+    }
+
+
+#marcs model index
+marcs_records = []
+
+for root, _, files in os.walk(MARCS_DIR):
+    for fname in files:
+        if fname.endswith((".mod.gz", ".mod")):
+            parsed = parse_marcs_filename(
+                os.path.join(root, fname)
+            )
+
+            if parsed is not None:
+                marcs_records.append(parsed)
+
+if MARCS_TAR is not None:
+    try:
+        with tarfile.open(MARCS_TAR, "r") as tar:
+            for member in tar.getmembers():
+
+                if not member.isfile():
+                    continue
+
+                if not member.name.endswith((".mod.gz", ".mod")):
+                    continue
+
+                parsed = parse_marcs_filename(member.name)
+
+                if parsed is not None:
+                    parsed["source"] = "tar"
+                    marcs_records.append(parsed)
+
+    except Exception as exc:
+        print("Warning:", exc)
+
+unique = {
+    rec["basename"]: rec
+    for rec in marcs_records
+}
+
+marcs_index = pd.DataFrame(
+    list(unique.values())
+)
+
+if len(marcs_index) == 0:
+
+    fallback = parse_marcs_filename(
+        MARCS_MODEL_HD195564
+    )
+
+    fallback["source"] = "existing"
+
+    marcs_index = pd.DataFrame([
+        fallback
+    ])
+
+print("Standard MARCS models indexed:", len(marcs_index))
+
+
+#choose closest marcs model
+def choose_marcs_model(teff, logg, feh):
+
+    x = marcs_index.copy()
+
+    x["distance"] = (
+        ((x["Teff"] - teff) / 200.0)**2 +
+        ((x["logg"] - logg) / 0.25)**2 +
+        ((x["FeH"] - feh) / 0.25)**2
+    )
+
+    return x.sort_values(
+        "distance"
+    ).iloc[0]
+
+
+#extract selected marcs model
+def get_marcs_model_path(member_or_path):
+
+    value = str(member_or_path)
+
+    if os.path.isfile(value):
+        return value
+
+    if MARCS_TAR is None:
+        raise FileNotFoundError(
+            "Selected MARCS model is only present in the tar archive."
+        )
+
+    cache_dir = os.path.join(
+        MARCS_DIR,
+        "selected_models"
+    )
+
+    os.makedirs(
+        cache_dir,
+        exist_ok=True
+    )
+
+    basename = os.path.basename(value)
+
+    output_path = os.path.join(
+        cache_dir,
+        basename
+    )
+
+    if os.path.exists(output_path):
+        return output_path
+
+    with tarfile.open(
+        MARCS_TAR,
+        "r"
+    ) as tar:
+
+        member = tar.getmember(value)
+        extracted = tar.extractfile(member)
+
+        if extracted is None:
+            raise RuntimeError(
+                "Could not extract MARCS model."
+            )
+
+        raw = extracted.read()
+
+    with open(
+        output_path,
+        "wb"
+    ) as f:
+
+        f.write(raw)
+
+    return output_path
+
+
+#read marcs model
+def read_marcs_model(path):
+
+    if path.endswith(".gz"):
+
+        with gzip.open(
+            path,
+            "rt",
+            encoding="utf-8",
+            errors="ignore"
+        ) as f:
+
+            return f.read()
+
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+
+        return f.read()
+
+
+#parse marcs structure
+def parse_marcs_structure(text):
+
+    model_lines = text.splitlines()
+
+    n_depth = None
+
+    for line in model_lines:
+
+        if "Number of depth points" in line:
+
+            match = re.search(
+                r"(\d+)\s+Number of depth points",
+                line
+            )
+
+            if match:
+                n_depth = int(match.group(1))
+                break
+
+    if n_depth is None:
+        raise RuntimeError(
+            "Could not find number of depth points."
+        )
+
+    header_index = None
+
+    for i, line in enumerate(model_lines):
+
+        stripped = line.strip()
+
+        if (
+            stripped.startswith("k ") and
+            "lgTauR" in stripped and
+            "Tau5" in stripped and
+            "Depth" in stripped and
+            "T" in stripped and
+            "Pe" in stripped and
+            "Pg" in stripped
+        ):
+
+            header_index = i
+            break
+
+    if header_index is None:
+
+        for i, line in enumerate(model_lines):
+
+            if (
+                "lgTauR" in line and
+                "Depth" in line and
+                "Pe" in line and
+                "Pg" in line
+            ):
+
+                header_index = i
+                break
+
+    if header_index is None:
+        raise RuntimeError(
+            "Could not find MARCS atmospheric structure header."
+        )
+
+    rows = []
+
+    i = header_index + 1
+
+    while (
+        len(rows) < n_depth and
+        i < len(model_lines)
+    ):
+
+        parts = model_lines[i].strip().split()
+
+        if len(parts) >= 9:
+
+            try:
+
+                values = [
+                    float(x.replace("D", "E"))
+                    for x in parts[:9]
+                ]
+
+                if np.isfinite(values).all():
+                    rows.append(values)
+
+            except ValueError:
+                pass
+
+        i += 1
+
+    if len(rows) != n_depth:
+        raise RuntimeError(
+            f"Expected {n_depth} depth rows, "
+            f"obtained {len(rows)}."
+        )
+
+    atm = pd.DataFrame(
+        rows,
+        columns=[
+            "k",
+            "lgTauR",
+            "lgTau5",
+            "Depth_cm",
+            "T_K",
+            "Pe_dyn_cm2",
+            "Pg_dyn_cm2",
+            "Prad_dyn_cm2",
+            "Pturb_dyn_cm2"
+        ]
+    )
+
+    if not (
+        np.all(np.diff(atm["k"]) >= 0) or
+        np.all(np.diff(atm["k"]) <= 0)
+    ):
+        raise RuntimeError(
+            "MARCS depth index is not monotonic."
+        )
+
+    if np.any(atm["T_K"] <= 0):
+        raise RuntimeError(
+            "Non-positive temperatures found."
+        )
+
+    if np.any(atm["Pe_dyn_cm2"] <= 0):
+        raise RuntimeError(
+            "Non-positive electron pressures found."
+        )
+
+    return atm
+
+
+#atmospheric densities
+def add_atmospheric_densities(atm):
+
+    out = atm.copy()
+
+    out["ne_cm3"] = (
+        out["Pe_dyn_cm2"] /
+        (
+            KB *
+            out["T_K"]
+        )
+    )
+
+    out["rho_g_cm3"] = (
+        out["Pg_dyn_cm2"] *
+        MU *
+        MH /
+        (
+            KB *
+            out["T_K"]
+        )
+    )
+
+    out["nH_cm3"] = (
+        X_H *
+        out["rho_g_cm3"] /
+        MH
+    )
+
+    return out
+
+
+#prepare atmosphere
+def prepare_atmosphere(teff, logg, feh):
+
+    chosen = choose_marcs_model(
+        teff,
+        logg,
+        feh
+    )
+
+    model_path = get_marcs_model_path(
+        chosen["member"]
+    )
+
+    model_text = read_marcs_model(
+        model_path
+    )
+
+    atm = parse_marcs_structure(
+        model_text
+    )
+
+    atm = add_atmospheric_densities(
+        atm
+    )
+
+    return chosen, model_path, atm
+
+
+#load hd195564 atmosphere
+hd_text = read_marcs_model(
+    MARCS_MODEL_HD195564
+)
+
+atm_hd = parse_marcs_structure(
+    hd_text
+)
+
+atm_hd = add_atmospheric_densities(
+    atm_hd
+)
+
+print("\nHD195564 MARCS atmosphere loaded")
+print("Model:", os.path.basename(MARCS_MODEL_HD195564))
+print("Depth layers:", len(atm_hd))
+
+print(
+    f"T range: "
+    f"{atm_hd['T_K'].min():.1f} - "
+    f"{atm_hd['T_K'].max():.1f} K"
+)
+
+print(
+    f"log(tau_Ross) range: "
+    f"{atm_hd['lgTauR'].min():.2f} - "
+    f"{atm_hd['lgTauR'].max():.2f}"
+)
+
+print(
+    f"electron density range: "
+    f"{atm_hd['ne_cm3'].min():.3e} - "
+    f"{atm_hd['ne_cm3'].max():.3e} cm^-3"
+)
+
+idx_tau1_hd = np.argmin(
+    np.abs(
+        atm_hd["lgTauR"].values
+    )
+)
+
+tau1_hd = atm_hd.iloc[
+    idx_tau1_hd
+]
+
+print("\nRepresentative layer near tau_Ross = 1")
+print(f"k  = {tau1_hd['k']:.0f}")
+print(f"T  = {tau1_hd['T_K']:.1f} K")
+print(f"Pe = {tau1_hd['Pe_dyn_cm2']:.4e} dyn cm^-2")
+print(f"Pg = {tau1_hd['Pg_dyn_cm2']:.4e} dyn cm^-2")
+print(f"ne = {tau1_hd['ne_cm3']:.4e} cm^-3")
+print(f"nH = {tau1_hd['nH_cm3']:.4e} cm^-3")
+
+display(atm_hd.head())
+
+
+#saha ionisation
+CHI_FEI = 7.9024681 * EV_TO_ERG
+
+
+def saha_fe(atm):
+
+    T = atm["T_K"].values
+    ne = atm["ne_cm3"].values
+
+    U1 = U_FeI(T)
+    U2 = U_FeII(T)
+
+    saha_ratio = (
+        (2.0 * U2 / U1) *
+        (2.0 * np.pi * ME * KB * T / H**2)**1.5 *
+        np.exp(
+            -CHI_FEI / (KB * T)
+        ) /
+        ne
+    )
+
+    fe1_frac = 1.0 / (
+        1.0 + saha_ratio
+    )
+
+    fe2_frac = saha_ratio / (
+        1.0 + saha_ratio
+    )
+
+    out = atm.copy()
+
+    out["FeII_FeI"] = saha_ratio
+    out["FeI_fraction"] = fe1_frac
+    out["FeII_fraction"] = fe2_frac
+
+    return out
+
+
+#boltzmann population
+def lower_level_population(
+    atm,
+    species,
+    excitation_cm1,
+    g_lower
+):
+
+    T = atm["T_K"].values
+
+    if species == "FeI":
+
+        U = U_FeI(T)
+        ion_fraction = atm["FeI_fraction"].values
+
+    elif species == "FeII":
+
+        U = U_FeII(T)
+        ion_fraction = atm["FeII_fraction"].values
+
+    else:
+
+        raise ValueError(
+            "species must be FeI or FeII"
+        )
+
+    feh_atm = atm.attrs.get(
+        "FeH",
+        CURRENT_FEH
+    )
+
+    n_fe_total = (
+        atm["nH_cm3"].values *
+        FE_H_SUN *
+        10**feh_atm
+    )
+
+    n_ion = (
+        n_fe_total *
+        ion_fraction
+    )
+
+    E = (
+        excitation_cm1 *
+        H *
+        C
+    )
+
+    n_lower = (
+        n_ion *
+        (g_lower / U) *
+        np.exp(
+            -E / (KB * T)
+        )
+    )
+
+    return n_lower
+
+
+#oscillator strength
+def gf_to_f(gf, g_lower):
+    return gf / g_lower
+
+
+#thermal doppler width
+def doppler_width(nu0, T):
+
+    M_FE = (
+        55.845 *
+        1.66053906660e-24
+    )
+
+    return (
+        nu0 / C *
+        np.sqrt(
+            2.0 *
+            KB *
+            T /
+            M_FE
+        )
+    )
+
+
+#gaussian profile
+def gaussian_profile(
+    nu,
+    nu0,
+    delta_nu
+):
+
+    return (
+        1.0 /
+        (
+            delta_nu *
+            np.sqrt(np.pi)
+        )
+    ) * np.exp(
+        -((nu - nu0) / delta_nu)**2
+    )
+
+
+#line opacity
+def line_opacity(
+    atm,
+    species,
+    wavelength_nm,
+    loggf,
+    Ei_cm1,
+    g_lower
+):
+
+    wavelength_cm = (
+        wavelength_nm *
+        1e-7
+    )
+
+    nu0 = C / wavelength_cm
+
+    gf = 10**loggf
+    f_lu = gf / g_lower
+
+    n_lower = lower_level_population(
+        atm,
+        species,
+        Ei_cm1,
+        g_lower
+    )
+
+    T = atm["T_K"].values
+
+    stimulated = (
+        1.0 -
+        np.exp(
+            -H * nu0 / (KB * T)
+        )
+    )
+
+    delta_nu = doppler_width(
+        nu0,
+        T
+    )
+
+    alpha0 = (
+        np.sqrt(np.pi) *
+        EE**2 /
+        (ME * C) *
+        f_lu *
+        n_lower *
+        stimulated /
+        delta_nu
+    )
+
+    return alpha0, n_lower
+
+
+#transfer grid
+def prepare_transfer_grid(atm):
+
+    out = atm.copy()
+
+    tau = 10**out["lgTauR"].values
+
+    idx = np.argsort(tau)
+
+    out = out.iloc[
+        idx
+    ].reset_index(drop=True)
+
+    tau = tau[idx]
+
+    depth = out["Depth_cm"].values
+
+    dtau = np.gradient(tau)
+    ddepth = np.gradient(depth)
+
+    alpha_R = np.abs(
+        dtau /
+        np.maximum(
+            np.abs(ddepth),
+            1e-30
+        )
+    )
+
+    finite_alpha = alpha_R[
+        np.isfinite(alpha_R)
+    ]
+
+    alpha_R = np.maximum(
+        alpha_R,
+        np.nanpercentile(
+            finite_alpha,
+            1
+        ) * 1e-6
+    )
+
+    out["tau_R"] = tau
+    out["alpha_R_cm-1"] = alpha_R
+
+    return out
+
+
+#planck function
+def planck_lambda(
+    wavelength_cm,
+    T
+):
+
+    a = 2.0 * H * C**2
+
+    b = (
+        H * C /
+        (
+            wavelength_cm *
+            KB *
+            T
+        )
+    )
+
+    return (
+        a /
+        (
+            wavelength_cm**5 *
+            (
+                np.exp(b) - 1.0
+            )
+        )
+    )
+
+
+#formal transfer
+def formal_lte_flux_lambda(
+    wavelength_cm,
+    tau_nu,
+    T,
+    mu_nodes,
+    mu_weights
+):
+
+    tau_nu = np.asarray(
+        tau_nu,
+        dtype=float
+    )
+
+    T = np.asarray(
+        T,
+        dtype=float
+    )
+
+    B = planck_lambda(
+        wavelength_cm,
+        T
+    )
+
+    order = np.argsort(tau_nu)
+
+    tau_nu = tau_nu[order]
+    B = B[order]
+
+    tau_nu = np.maximum.accumulate(
+        tau_nu
+    )
+
+    dtau = np.diff(tau_nu)
+
+    tau_mid = (
+        0.5 *
+        (
+            tau_nu[1:] +
+            tau_nu[:-1]
+        )
+    )
+
+    B_mid = (
+        0.5 *
+        (
+            B[1:] +
+            B[:-1]
+        )
+    )
+
+    I_mu = []
+
+    for mu in mu_nodes:
+
+        integrand = (
+            B_mid *
+            np.exp(
+                -tau_mid / mu
+            ) /
+            mu
+        )
+
+        I_mu.append(
+            np.sum(
+                integrand *
+                dtau
+            )
+        )
+
+    I_mu = np.asarray(
+        I_mu
+    )
+
+    return (
+        2.0 *
+        np.pi *
+        np.sum(
+            I_mu *
+            mu_nodes *
+            mu_weights
+        )
+    )
+
+
+#synthetic line profile
+def synthetic_line_profile(
+    atm,
+    species,
+    wavelength_nm,
+    loggf,
+    Ei_cm1,
+    g_lower,
+    v_window_kms=30,
+    n_points=1201,
+    resolving_power=115000
+):
+
+    atm = prepare_transfer_grid(
+        atm
+    )
+
+    lam0_cm = (
+        wavelength_nm *
+        1e-7
+    )
+
+    nu0 = C / lam0_cm
+
+    velocity = np.linspace(
+        -v_window_kms,
+        v_window_kms,
+        n_points
+    )
+
+    nu = (
+        nu0 *
+        (
+            1.0 -
+            velocity *
+            1e5 /
+            C
+        )
+    )
+
+    alpha_line, n_lower = line_opacity(
+        atm,
+        species,
+        wavelength_nm,
+        loggf,
+        Ei_cm1,
+        g_lower
+    )
+
+    alpha_R = np.maximum(
+        atm["alpha_R_cm-1"].values,
+        1e-30
+    )
+
+    tau_R = atm["tau_R"].values
+    T = atm["T_K"].values
+
+    M_FE = (
+        55.845 *
+        1.66053906660e-24
+    )
+
+    delta_nu = (
+        nu0 /
+        C *
+        np.sqrt(
+            2.0 *
+            KB *
+            T /
+            M_FE
+        )
+    )
+
+    x, w = np.polynomial.legendre.leggauss(5)
+
+    mu_nodes = 0.5 * (
+        x + 1.0
+    )
+
+    mu_weights = 0.5 * w
+
+    flux_line = []
+
+    tau_cont = tau_R.copy()
+
+    F_cont = formal_lte_flux_lambda(
+        lam0_cm,
+        tau_cont,
+        T,
+        mu_nodes,
+        mu_weights
+    )
+
+    for nu_i in nu:
+
+        profile_factor = np.exp(
+            -(
+                (
+                    nu_i - nu0
+                ) /
+                delta_nu
+            )**2
+        )
+
+        eta_phi = (
+            alpha_line /
+            alpha_R *
+            profile_factor
+        )
+
+        integrand = (
+            1.0 +
+            eta_phi
+        )
+
+        tau_nu = np.zeros_like(
+            tau_R
+        )
+
+        dtau_R = np.diff(
+            tau_R
+        )
+
+        tau_nu[1:] = np.cumsum(
+            0.5 *
+            (
+                integrand[1:] +
+                integrand[:-1]
+            ) *
+            dtau_R
+        )
+
+        F_line = formal_lte_flux_lambda(
+            C / nu_i,
+            tau_nu,
+            T,
+            mu_nodes,
+            mu_weights
+        )
+
+        flux_line.append(
+            F_line
+        )
+
+    flux_line = np.asarray(
+        flux_line
+    )
+
+    normalized_flux = (
+        flux_line /
+        F_cont
+    )
+
+    wavelength_nm_array = (
+        C / nu
+    ) * 1e7
+
+    order = np.argsort(
+        wavelength_nm_array
+    )
+
+    wavelength_nm_array = (
+        wavelength_nm_array[order]
+    )
+
+    normalized_flux = (
+        normalized_flux[order]
+    )
+
+    if (
+        resolving_power is not None and
+        resolving_power > 0
+    ):
+
+        dlambda = np.median(
+            np.diff(
+                wavelength_nm_array
+            )
+        )
+
+        fwhm_nm = (
+            wavelength_nm /
+            resolving_power
+        )
+
+        sigma_nm = (
+            fwhm_nm /
+            (
+                2.0 *
+                np.sqrt(
+                    2.0 *
+                    np.log(2.0)
+                )
+            )
+        )
+
+        sigma_pix = (
+            sigma_nm /
+            max(
+                abs(dlambda),
+                1e-12
+            )
+        )
+
+        if sigma_pix > 0.5:
+
+            half = int(
+                np.ceil(
+                    5.0 *
+                    sigma_pix
+                )
+            )
+
+            grid = np.arange(
+                -half,
+                half + 1
+            )
+
+            kernel = np.exp(
+                -0.5 *
+                (
+                    grid /
+                    sigma_pix
+                )**2
+            )
+
+            kernel /= kernel.sum()
+
+            normalized_flux = np.convolve(
+                normalized_flux,
+                kernel,
+                mode="same"
+            )
+
+    return (
+        wavelength_nm_array,
+        normalized_flux,
+        n_lower
+    )
+
+
+#observed spectrum
+OBS_PATH = (
+    "/content/"
+    "ADP.2014-09-25T15:34:59.850.fits"
+)
+
+if not os.path.exists(OBS_PATH):
+
+    print(
+        "Observed HARPS FITS not found:",
+        OBS_PATH
+    )
+
+else:
+
+    with fits.open(
+        OBS_PATH
+    ) as hdul:
+
+        spec = hdul["SPECTRUM"].data
+
+        wave_obs_A = np.asarray(
+            spec["WAVE"],
+            dtype=float
+        )
+
+        flux_obs = np.asarray(
+            spec["FLUX"],
+            dtype=float
+        )
+
+    valid = (
+        np.isfinite(wave_obs_A) &
+        np.isfinite(flux_obs) &
+        (flux_obs > 0)
+    )
+
+    wave_obs_A = (
+        wave_obs_A[valid]
+    )
+
+    flux_obs = (
+        flux_obs[valid]
+    )
+
+    print(
+        "Observed HD195564 spectrum:",
+        len(wave_obs_A),
+        "pixels"
+    )
+
+
+#observed equivalent width
+def measure_observed_ew(
+    wave_nm,
+    flux,
+    center_nm,
+    half_window_nm=0.04,
+    continuum_inner=0.025,
+    continuum_outer=0.040
+):
+
+    left = (
+        center_nm -
+        half_window_nm
+    )
+
+    right = (
+        center_nm +
+        half_window_nm
+    )
+
+    mask = (
+        (wave_nm >= left) &
+        (wave_nm <= right)
+    )
+
+    if np.sum(mask) < 10:
+        return np.nan, None, None
+
+    w = wave_nm[mask]
+    f = flux[mask]
+
+    cont_mask = (
+        (
+            (w >= center_nm - continuum_outer) &
+            (w <= center_nm - continuum_inner)
+        )
+        |
+        (
+            (w >= center_nm + continuum_inner) &
+            (w <= center_nm + continuum_outer)
+        )
+    )
+
+    if np.sum(cont_mask) < 4:
+        return np.nan, None, None
+
+    continuum = np.median(
+        f[cont_mask]
+    )
+
+    fn = (
+        f /
+        continuum
+    )
+
+    ew_nm = np.trapz(
+        np.clip(
+            1.0 - fn,
+            0,
+            None
+        ),
+        w
+    )
+
+    ew_mA = (
+        ew_nm *
+        1e4
+    )
+
+    return (
+        ew_mA,
+        w,
+        fn
+    )
+
+
+#select fe ii lines
+HD195564_FEII_WAVELENGTHS_NM = np.array([
+    492.3921,
+    499.3350,
+    500.0730,
+    510.0655,
+    513.2661,
+    523.4623,
+    525.6932,
+    526.4802,
+    532.5552,
+    541.4070,
+    542.5249,
+    553.4838,
+    636.9459,
+    643.2676
+])
+
+selected_fe2 = []
+
+for target_nm in (
+    HD195564_FEII_WAVELENGTHS_NM
+):
+
+    candidates = fe2_clean[
+        np.abs(
+            fe2_clean["obs_wl_air(nm)"] -
+            target_nm
+        ) <= 0.03
+    ].copy()
+
+    if len(candidates) == 0:
+        continue
+
+    candidates["_sep"] = np.abs(
+        candidates["obs_wl_air(nm)"] -
+        target_nm
+    )
+
+    candidates = candidates.sort_values(
+        [
+            "Ei(cm-1)",
+            "_sep",
+            "log_gf"
+        ],
+        ascending=[
+            True,
+            True,
+            False
+        ]
+    )
+
+    selected_fe2.append(
+        candidates.iloc[0]
+    )
+
+selected_fe2 = pd.DataFrame(
+    selected_fe2
+).drop_duplicates(
+    subset=[
+        "obs_wl_air(nm)"
+    ]
+).reset_index(
+    drop=True
+)
+
+
+#select fe i lines
+selected_fe1 = []
+
+if "wave_obs_A" in globals():
+
+    wave_nm_obs = (
+        wave_obs_A /
+        10.0
+    )
+
+    for _, row in fe1_clean.iterrows():
+
+        center = (
+            row["obs_wl_air(nm)"]
+        )
+
+        ew, wloc, floc = (
+            measure_observed_ew(
+                wave_nm_obs,
+                flux_obs,
+                center
+            )
+        )
+
+        if not np.isfinite(ew):
+            continue
+
+        if 5.0 <= ew <= 250.0:
+
+            selected_fe1.append({
+                "row": row,
+                "EW_mA": ew
+            })
+
+    selected_fe1 = sorted(
+        selected_fe1,
+        key=lambda x:
+        abs(
+            x["EW_mA"] -
+            60.0
+        )
+    )[:5]
+
+
+#print selected lines
+print("\nSelected Fe II lines")
+
+for _, r in selected_fe2.iterrows():
+
+    print(
+        f"{r['obs_wl_air(nm)']:.4f} nm | "
+        f"loggf={r['log_gf']:.3f} | "
+        f"Ei={r['Ei(cm-1)']:.1f} cm^-1 | "
+        f"g={r['g_i']}"
+    )
+
+print("\nSelected Fe I lines")
+
+for item in selected_fe1:
+
+    r = item["row"]
+
+    print(
+        f"{r['obs_wl_air(nm)']:.4f} nm | "
+        f"loggf={r['log_gf']:.3f} | "
+        f"Ei={r['Ei(cm-1)']:.1f} cm^-1 | "
+        f"g={r['g_i']} | "
+        f"EWobs={item['EW_mA']:.1f} mA"
+    )
+
+
+#calculate atmospheres
+all_atmospheres = {}
+summary_rows = []
+
+print("\nAtmosphere models")
+
+for _, star in stars.iterrows():
+
+    CURRENT_FEH = star["FeH"]
+
+    chosen, model_path, atm = (
+        prepare_atmosphere(
+            star["Teff"],
+            star["logg"],
+            CURRENT_FEH
+        )
+    )
+
+    atm = saha_fe(atm)
+
+    atm.attrs["FeH"] = (
+        float(star["FeH"])
+    )
+
+    atm.attrs["HIP"] = (
+        star["HIP"]
+    )
+
+    all_atmospheres[
+        star["HIP"]
+    ] = atm
+
+    summary_rows.append([
+        star["HIP"],
+        star["Type"],
+        star["Teff"],
+        star["logg"],
+        star["FeH"],
+        chosen["Teff"],
+        chosen["logg"],
+        chosen["FeH"]
+    ])
+
+    print(
+        f"{star['HIP']:10s} | "
+        f"target=({star['Teff']:.0f}, "
+        f"{star['logg']:.2f}, "
+        f"{star['FeH']:.3f}) | "
+        f"MARCS=({chosen['Teff']:.0f}, "
+        f"{chosen['logg']:.1f}, "
+        f"{chosen['FeH']:.1f}) | "
+        f"distance={chosen['distance']:.3f}"
+    )
+
+summary = pd.DataFrame(
+    summary_rows,
+    columns=[
+        "HIP",
+        "Type",
+        "Teff",
+        "logg",
+        "FeH",
+        "MARCS_Teff",
+        "MARCS_logg",
+        "MARCS_FeH"
+    ]
+)
+
+
+#ionisation ratio
+ratio_rows = []
+
+for _, star in stars.iterrows():
+
+    atm = all_atmospheres[
+        star["HIP"]
+    ]
+
+    idx = np.argmin(
+        np.abs(
+            atm["lgTauR"].values
+        )
+    )
+
+    fei = atm.iloc[
+        idx
+    ]["FeI_fraction"]
+
+    feii = atm.iloc[
+        idx
+    ]["FeII_fraction"]
+
+    ratio = (
+        feii /
+        fei
+    )
+
+    ratio_rows.append([
+        star["HIP"],
+        star["Type"],
+        star["Teff"],
+        star["logg"],
+        star["FeH"],
+        ratio
+    ])
+
+ratio_df = pd.DataFrame(
+    ratio_rows,
+    columns=[
+        "HIP",
+        "Type",
+        "Teff",
+        "logg",
+        "FeH",
+        "FeII_FeI"
+    ]
+)
+
+display(ratio_df)
+
+
+#plot temperature structure
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+for hip, atm in all_atmospheres.items():
+
+    ax.plot(
+        atm["lgTauR"],
+        atm["T_K"],
+        linewidth=2,
+        label=hip
+    )
+
+ax.invert_xaxis()
+
+ax.set_xlabel(
+    r"$\log\,\tau_{\rm Ross}$"
+)
+
+ax.set_ylabel(
+    "Temperature (K)"
+)
+
+ax.set_title(
+    "MARCS atmospheric temperature structure"
+)
+
+ax.legend(
+    fontsize=8,
+    ncol=2
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "Temperature_Structure.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#plot fe i fraction
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+for hip, atm in all_atmospheres.items():
+
+    ax.plot(
+        atm["lgTauR"],
+        atm["FeI_fraction"],
+        linewidth=1.8,
+        label=hip
+    )
+
+ax.invert_xaxis()
+ax.set_yscale("log")
+
+ax.set_xlabel(
+    r"$\log\,\tau_{\rm Ross}$"
+)
+
+ax.set_ylabel(
+    "Fe I ionization fraction"
+)
+
+ax.set_title(
+    "Fe I fraction through the stellar atmosphere"
+)
+
+ax.legend(
+    fontsize=8,
+    ncol=2
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "FeI_Fraction.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#plot fe ii fraction
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+for hip, atm in all_atmospheres.items():
+
+    ax.plot(
+        atm["lgTauR"],
+        atm["FeII_fraction"],
+        linewidth=1.8,
+        label=hip
+    )
+
+ax.invert_xaxis()
+
+ax.set_xlabel(
+    r"$\log\,\tau_{\rm Ross}$"
+)
+
+ax.set_ylabel(
+    "Fe II ionization fraction"
+)
+
+ax.set_title(
+    "Fe II fraction through the stellar atmosphere"
+)
+
+ax.legend(
+    fontsize=8,
+    ncol=2
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "FeII_Fraction.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#plot fe ii fe i ratio
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+ax.scatter(
+    ratio_df["Teff"],
+    ratio_df["FeII_FeI"],
+    s=70
+)
+
+for _, r in ratio_df.iterrows():
+
+    ax.annotate(
+        r["HIP"],
+        (
+            r["Teff"],
+            r["FeII_FeI"]
+        ),
+        xytext=(5, 5),
+        textcoords="offset points",
+        fontsize=8
+    )
+
+ax.set_yscale("log")
+
+ax.set_xlabel(
+    r"$T_{\rm eff}$ (K)"
+)
+
+ax.set_ylabel(
+    r"$n_{\rm FeII}/n_{\rm FeI}$ at $\tau_{\rm Ross}\approx1$"
+)
+
+ax.set_title(
+    "LTE Fe ionization ratio across FGK stars"
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "FeII_FeI_Ratio.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#prepare synthetic lines
+atm_hd = all_atmospheres[
+    "HIP101345"
+]
+
+CURRENT_FEH = float(
+    atm_hd.attrs.get(
+        "FeH",
+        -0.037
+    )
+)
+
+synthetic_lines = []
+
+for item in selected_fe1[:3]:
+
+    r = item["row"]
+
+    synthetic_lines.append({
+        "species": "FeI",
+        "wavelength": r["obs_wl_air(nm)"],
+        "loggf": r["log_gf"],
+        "Ei": r["Ei(cm-1)"],
+        "g": r["g_i"]
+    })
+
+fe2_for_synthesis = (
+    selected_fe2
+    .sort_values(
+        ["Ei(cm-1)", "log_gf"],
+        ascending=[True, False]
+    )
+    .head(3)
+)
+
+for _, r in fe2_for_synthesis.iterrows():
+
+    synthetic_lines.append({
+        "species": "FeII",
+        "wavelength": r["obs_wl_air(nm)"],
+        "loggf": r["log_gf"],
+        "Ei": r["Ei(cm-1)"],
+        "g": r["g_i"]
+    })
+
+print("\nSynthetic lines")
+
+for L in synthetic_lines:
+
+    print(
+        L["species"],
+        f"{L['wavelength']:.4f} nm",
+        f"loggf={L['loggf']:.3f}",
+        f"Ei={L['Ei']:.1f} cm^-1"
+    )
+
+
+#calculate model equivalent widths
+profile_results = []
+
+if "wave_obs_A" in globals():
+
+    wave_nm_obs = (
+        wave_obs_A /
+        10.0
+    )
+
+    for L in synthetic_lines:
+
+        ws, fs, nlower = (
+            synthetic_line_profile(
+                atm_hd,
+                L["species"],
+                L["wavelength"],
+                L["loggf"],
+                L["Ei"],
+                L["g"]
+            )
+        )
+
+        ew_obs, _, _ = (
+            measure_observed_ew(
+                wave_nm_obs,
+                flux_obs,
+                L["wavelength"],
+                half_window_nm=0.04
+            )
+        )
+
+        ew_syn_nm = np.trapz(
+            np.clip(
+                1.0 - fs,
+                0,
+                None
+            ),
+            ws
+        )
+
+        ew_syn_mA = (
+            ew_syn_nm *
+            1e4
+        )
+
+        profile_results.append({
+            "Species": L["species"],
+            "Wave_nm": L["wavelength"],
+            "loggf": L["loggf"],
+            "Ei_cm1": L["Ei"],
+            "EW_obs_mA": ew_obs,
+            "EW_model_mA": ew_syn_mA
+        })
+
+profile_df = pd.DataFrame(
+    profile_results
+)
+
+print("\nProfile and EW results")
+
+display(
+    profile_df
+)
+
+
+#prepare ew comparison
+if len(profile_df) > 0:
+
+    clean = profile_df.dropna(
+        subset=[
+            "EW_obs_mA",
+            "EW_model_mA"
+        ]
+    )
+
+else:
+
+    clean = pd.DataFrame()
+
+
+#boltzmann excitation
+representative_lines = []
+
+for _, r in fe1_clean.sample(
+    min(
+        15,
+        len(fe1_clean)
+    ),
+    random_state=42
+).iterrows():
+
+    representative_lines.append({
+        "species": "FeI",
+        "Ei": r["Ei(cm-1)"],
+        "loggf": r["log_gf"],
+        "g": r["g_i"],
+        "wave": r["obs_wl_air(nm)"]
+    })
+
+for _, r in fe2_clean.sample(
+    min(
+        15,
+        len(fe2_clean)
+    ),
+    random_state=42
+).iterrows():
+
+    representative_lines.append({
+        "species": "FeII",
+        "Ei": r["Ei(cm-1)"],
+        "loggf": r["log_gf"],
+        "g": r["g_i"],
+        "wave": r["obs_wl_air(nm)"]
+    })
+
+idx_tau1 = np.argmin(
+    np.abs(
+        atm_hd["lgTauR"].values
+    )
+)
+
+T_tau1 = atm_hd.iloc[
+    idx_tau1
+]["T_K"]
+
+CURRENT_FEH = -0.037
+
+boltz_rows = []
+
+for L in representative_lines:
+
+    pop = lower_level_population(
+        atm_hd,
+        L["species"],
+        L["Ei"],
+        L["g"]
+    )[idx_tau1]
+
+    boltz_rows.append([
+        L["species"],
+        L["Ei"],
+        L["Ei"] *
+        CMINV_TO_EV,
+        pop
+    ])
+
+boltz_df = pd.DataFrame(
+    boltz_rows,
+    columns=[
+        "Species",
+        "Ei_cm1",
+        "Ei_eV",
+        "n_lower"
+    ]
+)
+
+
+#plot model vs observed equivalent width
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+if len(clean) > 0:
+
+    for species in clean[
+        "Species"
+    ].unique():
+
+        sub = clean[
+            clean["Species"] ==
+            species
+        ]
+
+        ax.scatter(
+            sub["EW_obs_mA"],
+            sub["EW_model_mA"],
+            s=70,
+            label=species
+        )
+
+    maxv = max(
+        clean["EW_obs_mA"].max(),
+        clean["EW_model_mA"].max()
+    )
+
+    ax.plot(
+        [0, maxv],
+        [0, maxv],
+        "--",
+        linewidth=1.5,
+        label="1:1"
+    )
+
+    ax.set_xlabel(
+        r"$W_{\lambda,\rm obs}$ (mÅ)"
+    )
+
+    ax.set_ylabel(
+        r"$W_{\lambda,\rm model}$ (mÅ)"
+    )
+
+    ax.set_title(
+        "LTE model vs observed equivalent widths"
+    )
+
+    ax.legend()
+
+    ax.grid(
+        alpha=0.25
+    )
+
+else:
+
+    ax.text(
+        0.5,
+        0.5,
+        "No valid EW pairs",
+        ha="center",
+        va="center",
+        transform=ax.transAxes
+    )
+
+    ax.set_title(
+        "LTE model vs observed equivalent widths"
+    )
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "EW_Model_vs_Observed.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#plot boltzmann excitation
+fig, ax = plt.subplots(
+    figsize=(8, 6)
+)
+
+for species in [
+    "FeI",
+    "FeII"
+]:
+
+    sub = boltz_df[
+        boltz_df["Species"] ==
+        species
+    ]
+
+    ax.scatter(
+        sub["Ei_eV"],
+        sub["n_lower"],
+        s=50,
+        label=species
+    )
+
+ax.set_yscale("log")
+
+ax.set_xlabel(
+    "Lower-level excitation energy (eV)"
+)
+
+ax.set_ylabel(
+    r"Lower-level population $n_l$ (cm$^{-3}$)"
+)
+
+ax.set_title(
+    f"Boltzmann excitation at "
+    f"$T\\approx{T_tau1:.0f}$ K"
+)
+
+ax.legend()
+
+ax.grid(
+    alpha=0.25
+)
+
+fig.savefig(
+    os.path.join(
+        BASE,
+        "Boltzmann_Excitation.png"
+    ),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+#save numerical results
+summary.to_csv(
+    os.path.join(
+        BASE,
+        "FGK_MARCS_model_summary.csv"
+    ),
+    index=False
+)
+
+ratio_df.to_csv(
+    os.path.join(
+        BASE,
+        "FGK_FeII_FeI_ratio.csv"
+    ),
+    index=False
+)
+
+if len(profile_df) > 0:
+
+    profile_df.to_csv(
+        os.path.join(
+            BASE,
+            "HD195564_synthetic_observed_EW.csv"
+        ),
+        index=False
+    )
+
+print("\nAnalysis complete.")
+print("Results saved in:", BASE)
